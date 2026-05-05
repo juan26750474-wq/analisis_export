@@ -4,66 +4,81 @@ import numpy as np
 from sklearn.ensemble import IsolationForest
 from sqlalchemy import create_engine
 
-def run_top_market_analysis():
+def run_advanced_analysis():
+    # 1. CONEXIÓN
     engine = create_engine(f"mysql+mysqlconnector://{os.getenv('DB_USER')}:{os.getenv('DB_PASS')}@{os.getenv('DB_HOST')}/{os.getenv('DB_NAME')}")
 
-    # 1. EXTRACCIÓN DE DATOS BASE
-    query = """
-    SELECT PR, PA, codigo, peso, valor 
+    # Variables de tiempo (Ajusta según tus datos)
+    ano_analisis = 23 # El año que queremos vigilar
+    ano_inicio = 19   # El año desde el que cogemos el histórico
+
+    # 2. EXTRACCIÓN (Últimos años para crear el histórico)
+    query = f"""
+    SELECT ano, PR, PA, codigo, peso, valor 
     FROM datos 
     WHERE (codigo LIKE '0702%' OR codigo LIKE '0707%' OR codigo LIKE '070960%' 
            OR codigo LIKE '070993%' OR codigo LIKE '070930%')
-    AND ano = 23
+    AND ano >= {ano_inicio} AND ano <= {ano_analisis}
     """
     df_raw = pd.read_sql(query, engine)
 
-    # 2. IDENTIFICAR EL "TOP"
-    # Las 5 provincias que más kilos exportan
-    top_provincias = df_raw.groupby('PR')['peso'].sum().nlargest(5).index.tolist()
-    
-    # Los 15 países que más kilos reciben
-    top_paises = df_raw.groupby('PA')['peso'].sum().nlargest(15).index.tolist()
-
-    # 3. FILTRAR EL DATAFRAME
-    # Solo nos quedamos con la élite de los datos
-    df = df_raw[(df_raw['PR'].isin(top_provincias)) & (df_raw['PA'].isin(top_paises))].copy()
-    
-    print(f"✅ Analizando el Top 5 PR y Top 15 PA ({len(df)} registros agrupados)")
-
-    # 4. AGRUPACIÓN ANUAL
-    df_agrupado = df.groupby(['PR', 'PA', 'codigo']).agg({
+    # 3. AGRUPACIÓN ANUAL
+    df_anual = df_raw.groupby(['ano', 'PR', 'PA', 'codigo']).agg({
         'peso': 'sum',
         'valor': 'sum'
     }).reset_index()
+
+    # 4. CÁLCULO HISTÓRICO (Z-SCORE DE VOLUMEN)
+    # Filtramos los años pasados
+    historico = df_anual[df_anual['ano'] < ano_analisis].copy()
+    stats_historico = historico.groupby(['PR', 'PA', 'codigo'])['peso'].agg(['mean', 'std']).reset_index()
+    stats_historico.rename(columns={'mean': 'media_kilos_historico', 'std': 'std_kilos_historico'}, inplace=True)
+
+    # Filtramos el año actual
+    df_actual = df_anual[df_anual['ano'] == ano_analisis].copy()
+    df_actual['precio_medio'] = df_actual['valor'] / df_actual['peso']
+
+    # Cruzamos el año actual con su propio pasado
+    df_final = pd.merge(df_actual, stats_historico, on=['PR', 'PA', 'codigo'], how='left')
+
+    # Calculamos cuánto se desvían los kilos de este año de su propia media histórica
+    df_final['std_kilos_historico'] = df_final['std_kilos_historico'].replace(0, np.nan)
+    df_final['z_score_peso'] = (df_final['peso'] - df_final['media_kilos_historico']) / df_final['std_kilos_historico']
+    df_final['z_score_peso'] = df_final['z_score_peso'].fillna(0) # Si no hay histórico suficiente, lo dejamos neutro
+
+    # 5. FILTRO TOP 5 PROVINCIAS Y TOP 15 PAÍSES
+    top_provincias = df_actual.groupby('PR')['peso'].sum().nlargest(5).index.tolist()
+    top_paises = df_actual.groupby('PA')['peso'].sum().nlargest(15).index.tolist()
+    df_top = df_final[(df_final['PR'].isin(top_provincias)) & (df_final['PA'].isin(top_paises))].copy()
+
+    # 6. CÁLCULO TRANSVERSAL (Z-SCORE DE PRECIO)
+    stats_precio = df_top.groupby(['codigo', 'PA'])['precio_medio'].agg(['mean', 'std']).reset_index()
+    stats_precio.rename(columns={'mean': 'media_precio_mercado', 'std': 'std_precio_mercado'}, inplace=True)
     
-    df_agrupado['precio_medio'] = df_agrupado['valor'] / df_agrupado['peso']
-
-    # 5. NORMALIZACIÓN POR MERCADO (Z-Score)
-    # Comparamos a las grandes provincias entre sí dentro de cada gran país
-    stats = df_agrupado.groupby(['codigo', 'PA'])['precio_medio'].agg(['mean', 'std']).reset_index()
-    df_agrupado = df_agrupado.merge(stats, on=['codigo', 'PA'])
-
-    # Z-Score del precio (distancia al promedio del Top)
-    df_agrupado['z_score_precio'] = (df_agrupado['precio_medio'] - df_agrupado['mean']) / (df_agrupado['std'] + 1e-6)
-
-    # 6. ISOLATION FOREST
-    # Analizamos peso total anual y la desviación de precio
-    features = ['peso', 'z_score_precio']
+    df_top = pd.merge(df_top, stats_precio, on=['codigo', 'PA'], how='left')
     
-    model = IsolationForest(contamination=0.05, random_state=42) # Subimos un poco el % al ser menos datos
-    df_agrupado['es_anomalo'] = model.fit_predict(df_agrupado[features])
+    df_top['std_precio_mercado'] = df_top['std_precio_mercado'].replace(0, np.nan)
+    df_top['z_score_precio'] = (df_top['precio_medio'] - df_top['media_precio_mercado']) / df_top['std_precio_mercado']
+    df_top['z_score_precio'] = df_top['z_score_precio'].fillna(0)
 
-    # 7. GUARDAR RESULTADOS
-    result = df_agrupado[df_agrupado['es_anomalo'] == -1].copy()
+    # 7. MODELO ISOLATION FOREST CON LAS 2 LENTES
+    features = ['z_score_peso', 'z_score_precio']
+    
+    model = IsolationForest(contamination=0.05, random_state=42)
+    df_top['es_anomalo'] = model.fit_predict(df_top[features])
+
+    # 8. GUARDAR EN MYSQL
+    result = df_top[df_top['es_anomalo'] == -1].copy()
 
     if not result.empty:
-        # Añadimos columnas de identificación para saber quiénes son los tops
-        result['analisis_tipo'] = "TOP_5PR_15PA"
-        result.to_sql('alertas_top_mercado', con=engine, if_exists='replace', index=False)
-        print(f"✅ Se han detectado {len(result)} anomalías en los mercados principales.")
-        print(f"Provincias analizadas: {top_provincias}")
+        # Renombramos para que el PHP lo lea fácil
+        result.rename(columns={'media_precio_mercado': 'mean'}, inplace=True)
+        columnas_guardar = ['PR', 'PA', 'codigo', 'peso', 'valor', 'precio_medio', 'mean', 'z_score_precio', 'media_kilos_historico', 'z_score_peso', 'es_anomalo']
+        
+        result[columnas_guardar].to_sql('alertas_top_mercado', con=engine, if_exists='replace', index=False)
+        print(f"✅ Éxito: {len(result)} anomalías detectadas combinando análisis Histórico y Transversal.")
     else:
-        print("No se detectaron anomalías en los mercados top.")
+        print("No se detectaron anomalías.")
 
 if __name__ == "__main__":
-    run_top_market_analysis()
+    run_advanced_analysis()
