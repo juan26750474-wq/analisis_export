@@ -3,76 +3,67 @@ import pandas as pd
 import numpy as np
 from sklearn.ensemble import IsolationForest
 from sqlalchemy import create_engine
-import mysql.connector
 
-def run_anomaly_detection():
-    # 1. CREDENCIALES (GitHub Secrets)
-    user = os.getenv('DB_USER')
-    password = os.getenv('DB_PASS')
-    host = os.getenv('DB_HOST')
-    name = os.getenv('DB_NAME')
+def run_top_market_analysis():
+    engine = create_engine(f"mysql+mysqlconnector://{os.getenv('DB_USER')}:{os.getenv('DB_PASS')}@{os.getenv('DB_HOST')}/{os.getenv('DB_NAME')}")
 
-    # 2. EXTRACCIÓN DE DATOS
-    # Filtramos por los 5 productos clave
+    # 1. EXTRACCIÓN DE DATOS BASE
     query = """
-    SELECT ano, mes, flujo, PA, codigo, peso, valor 
+    SELECT PR, PA, codigo, peso, valor 
     FROM datos 
-    WHERE codigo LIKE '0702%' -- Tomate
-       OR codigo LIKE '0707%' -- Pepino
-       OR codigo LIKE '070960%' -- Pimiento
-       OR codigo LIKE '070993%' -- Calabacín
-       OR codigo LIKE '070930%' -- Berenjena
+    WHERE (codigo LIKE '0702%' OR codigo LIKE '0707%' OR codigo LIKE '070960%' 
+           OR codigo LIKE '070993%' OR codigo LIKE '070930%')
+    AND ano = 23
     """
+    df_raw = pd.read_sql(query, engine)
+
+    # 2. IDENTIFICAR EL "TOP"
+    # Las 5 provincias que más kilos exportan
+    top_provincias = df_raw.groupby('PR')['peso'].sum().nlargest(5).index.tolist()
     
-    try:
-        # Usamos engine de SQLAlchemy para facilitar la lectura y escritura
-        engine = create_engine(f"mysql+mysqlconnector://{user}:{password}@{host}/{name}")
-        df = pd.read_sql(query, engine)
-        print(f"✅ Datos importados: {len(df)} registros.")
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        return
+    # Los 15 países que más kilos reciben
+    top_paises = df_raw.groupby('PA')['peso'].sum().nlargest(15).index.tolist()
 
-    if df.empty: return
-
-    # 3. INGENIERÍA DE VARIABLES (Análisis de tendencias)
-    df = df.sort_values(by=['codigo', 'PA', 'ano', 'mes'])
-    df['precio_u'] = df['valor'] / df['peso']
-
-    # Calculamos medias móviles de 12 meses para PESO, VALOR y PRECIO
-    # Esto permite al modelo saber qué es "normal" para ese mercado
-    for col in ['peso', 'valor', 'precio_u']:
-        df[f'media_12m_{col}'] = df.groupby(['codigo', 'PA'])[col].transform(
-            lambda x: x.rolling(window=12, min_periods=1).mean()
-        )
-        # Ratio respecto a la media: si es 1 es normal, si es 10 es una anomalía masiva
-        df[f'ratio_{col}'] = df[col] / (df[f'media_12m_{col}'] + 1e-6)
-
-    # Limpieza de datos
-    df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=['precio_u', 'ratio_peso', 'ratio_valor'])
-
-    # 4. MODELO ISOLATION FOREST (Multivariable)
-    # Aquí es donde ocurre la magia: mira el cruce de todas estas variables
-    features = ['peso', 'valor', 'precio_u', 'ratio_peso', 'ratio_valor', 'ratio_precio_u']
+    # 3. FILTRAR EL DATAFRAME
+    # Solo nos quedamos con la élite de los datos
+    df = df_raw[(df_raw['PR'].isin(top_provincias)) & (df_raw['PA'].isin(top_paises))].copy()
     
-    # Contaminación al 1%: buscará el 1% más extraño combinando kilos, valor y precio
-    model = IsolationForest(contamination=0.01, random_state=42)
-    df['anomaly_signal'] = model.fit_predict(df[features])
+    print(f"✅ Analizando el Top 5 PR y Top 15 PA ({len(df)} registros agrupados)")
 
-    # 5. FILTRAR Y VOLVER A LA BASE DE DATOS
-    anomalias = df[df['anomaly_signal'] == -1].copy()
+    # 4. AGRUPACIÓN ANUAL
+    df_agrupado = df.groupby(['PR', 'PA', 'codigo']).agg({
+        'peso': 'sum',
+        'valor': 'sum'
+    }).reset_index()
+    
+    df_agrupado['precio_medio'] = df_agrupado['valor'] / df_agrupado['peso']
 
-    if not anomalias.empty:
-        # Quitamos las columnas de cálculo intermedio para que la tabla sea limpia
-        cols_finales = ['ano', 'mes', 'flujo', 'PA', 'codigo', 'peso', 'valor', 'precio_u', 'anomaly_signal']
-        
-        # Guardar en phpMyAdmin (creará la tabla 'alertas_expor' si no existe)
-        anomalias[cols_finales].to_sql('alertas_expor', con=engine, if_exists='replace', index=False)
-        
-        print(f"✅ Se han detectado {len(anomalias)} anomalías.")
-        print("✅ Los resultados ya están disponibles en la tabla 'alertas_expor' de tu base de datos.")
+    # 5. NORMALIZACIÓN POR MERCADO (Z-Score)
+    # Comparamos a las grandes provincias entre sí dentro de cada gran país
+    stats = df_agrupado.groupby(['codigo', 'PA'])['precio_medio'].agg(['mean', 'std']).reset_index()
+    df_agrupado = df_agrupado.merge(stats, on=['codigo', 'PA'])
+
+    # Z-Score del precio (distancia al promedio del Top)
+    df_agrupado['z_score_precio'] = (df_agrupado['precio_medio'] - df_agrupado['mean']) / (df_agrupado['std'] + 1e-6)
+
+    # 6. ISOLATION FOREST
+    # Analizamos peso total anual y la desviación de precio
+    features = ['peso', 'z_score_precio']
+    
+    model = IsolationForest(contamination=0.05, random_state=42) # Subimos un poco el % al ser menos datos
+    df_agrupado['es_anomalo'] = model.fit_predict(df_agrupado[features])
+
+    # 7. GUARDAR RESULTADOS
+    result = df_agrupado[df_agrupado['es_anomalo'] == -1].copy()
+
+    if not result.empty:
+        # Añadimos columnas de identificación para saber quiénes son los tops
+        result['analisis_tipo'] = "TOP_5PR_15PA"
+        result.to_sql('alertas_top_mercado', con=engine, if_exists='replace', index=False)
+        print(f"✅ Se han detectado {len(result)} anomalías en los mercados principales.")
+        print(f"Provincias analizadas: {top_provincias}")
     else:
-        print("No se detectaron anomalías con los parámetros actuales.")
+        print("No se detectaron anomalías en los mercados top.")
 
 if __name__ == "__main__":
-    run_anomaly_detection()
+    run_top_market_analysis()
