@@ -1,31 +1,38 @@
-name: Ejecutar Analisis de Anomalias
+name: Ejecutar Detector de Anomalias
 
 on:
   push:
-    branches: [ main ]  # Se ejecuta cada vez que subes cambios
-  schedule:
-    - cron: '0 0 1 * *' # Se ejecuta automáticamente el día 1 de cada mes
+    branches:
+      - main  # Se ejecuta cuando subes cambios a la rama principal
+  workflow_dispatch:  # Te permite ejecutarlo manualmente desde GitHub
 
 jobs:
-  build:
+  run-anomaly-detector:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout del codigo
-        uses: actions/checkout@v3
+      # 1. Descarga el código de tu repositorio (VERSIÓN ACTUALIZADA)
+      - name: Checkout del código
+        uses: actions/checkout@v4
 
+      # 2. Prepara el entorno de Python (VERSIÓN ACTUALIZADA)
       - name: Configurar Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.9'
+          python-version: '3.10'
 
+      # 3. Instala las librerías necesarias para tu script
       - name: Instalar dependencias
         run: |
-          pip install pandas numpy scikit-learn mysql-connector-python sqlalchemy
+          python -m pip install --upgrade pip
+          pip install pandas numpy scikit-learn sqlalchemy mysql-connector-python
 
-      - name: Ejecutar script de ML
+      # 4. Ejecuta el script de Machine Learning
+      - name: Ejecutar script de Python
         env:
           DB_HOST: ${{ secrets.DB_HOST }}
           DB_USER: ${{ secrets.DB_USER }}
           DB_PASS: ${{ secrets.DB_PASS }}
           DB_NAME: ${{ secrets.DB_NAME }}
-        run: python main.py
+        run: |
+          python detector_anomalias.py
