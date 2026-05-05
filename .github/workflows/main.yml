@@ -35,4 +35,4 @@ jobs:
           DB_PASS: ${{ secrets.DB_PASS }}
           DB_NAME: ${{ secrets.DB_NAME }}
         run: |
-          python detector_anomalias.py
+          python main.py
