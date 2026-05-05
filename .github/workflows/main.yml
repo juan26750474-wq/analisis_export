@@ -1,0 +1,31 @@
+name: Ejecutar Analisis de Anomalias
+
+on:
+  push:
+    branches: [ main ]  # Se ejecuta cada vez que subes cambios
+  schedule:
+    - cron: '0 0 1 * *' # Se ejecuta automáticamente el día 1 de cada mes
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout del codigo
+        uses: actions/checkout@v3
+
+      - name: Configurar Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Instalar dependencias
+        run: |
+          pip install pandas numpy scikit-learn mysql-connector-python sqlalchemy
+
+      - name: Ejecutar script de ML
+        env:
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASS: ${{ secrets.DB_PASS }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+        run: python main.py
