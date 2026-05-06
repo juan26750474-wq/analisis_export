@@ -61,7 +61,7 @@ def run_advanced_analysis():
     df_final = pd.merge(df_actual_agrupado, stats_historico, on=['PR', 'PA', 'codigo'], how='left')
 
     # 5. FILTROS DE RELEVANCIA (Para limpiar la "basura" estadística)
-    MIN_KILOS_ANUALES = 50000        # Ignorar rutas que mueven menos de 50.000 kg al año
+    MIN_KILOS_ANUALES = 150000        # Ignorar rutas que mueven menos de 50.000 kg al año
     MIN_PORCENTAJE_HISTORICO = 0.15  # Ignorar si exportaron menos del 15% de su histórico habitual
 
     df_final = df_final[df_final['peso'] >= MIN_KILOS_ANUALES]
